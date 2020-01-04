@@ -4,56 +4,38 @@ import (
 	"errors"
 	"fmt"
 	"github.com/go-redis/redis/v7"
+	"log"
 	"math/rand"
-	"strconv"
 	"time"
 )
 
 const (
 	namespacePrefix = "global-rate-limiter"
-	thresholdKey = namespacePrefix + ":threshold"
-	intervalKey = namespacePrefix + ":interval"
-	resetTimeKey = namespacePrefix + ":reset-key"
-	lockedKey = namespacePrefix + ":locked"
-	counterKey = namespacePrefix + ":counter"
-	heldKey = namespacePrefix + ":held"
+	thresholdKey    = namespacePrefix + ":threshold"
+	intervalKey     = namespacePrefix + ":interval"
+	resetTimeKey    = namespacePrefix + ":reset-time"
+	lockedKey       = namespacePrefix + ":locked"
+	counterKey      = namespacePrefix + ":counter"
+	heldKey         = namespacePrefix + ":held"
 )
 
 var AcquireLockErr = errors.New("failed to acquire lock")
 
-func initRedis(c *redis.Client, rl ratelimiter) {
-	id, err := acquireLockWithTimeout(c.Conn(), time.Second, time.Second)
-	if err != nil {
-		if errors.Is(err, AcquireLockErr) {
-
-		} else {
-
-		}
-	}
-
-	c.Watch(func(tx *redis.Tx) error {
-		tx.Pipelined(func(pip redis.Pipeliner) error {
-			pip.MSet(
-				thresholdKey, rl.threshold,
-				intervalKey, rl.interval.Seconds(),
-				resetTimeKey, time.Now().Add(rl.interval).Unix(),
-				//namespacePrefix+":held", 0,
-			)
-			return nil
-		})
-		return nil
-	})
-	_ = releaseLock(c, id)
-}
-
 func acquireLockWithTimeout(conn *redis.Conn, acquireTimout, lockTimout time.Duration) (string, error) {
+	defer conn.Close()
+	rand.Seed(time.Now().UnixNano())
 	identifier := fmt.Sprint(rand.Int())
 	end := time.Now().Add(acquireTimout)
 	for time.Now().Before(end) {
-		if conn.SetNX(lockedKey, identifier, lockTimout).Val() {
+		cmd := conn.SetNX(lockedKey, identifier, lockTimout)
+
+		if cmd.Val() {
 			return identifier, nil
+		} else {
+			fmt.Println(cmd.Err())
 		}
-		time.Sleep(time.Millisecond * 10)
+
+		time.Sleep(time.Millisecond)
 	}
 	return "", fmt.Errorf("acqurelockError denied: %w", AcquireLockErr)
 }
@@ -70,33 +52,53 @@ func releaseLock(c *redis.Client, identifier string) error {
 
 }
 
-func increase(c *redis.Client) error{
-	id, _ := acquireLockWithTimeout(c.Conn(), time.Second, time.Second)
-	err := c.Watch(func(tx *redis.Tx) error {
-		if tx.Get(heldKey).Val() == "1" {
+func (r *ratelimiter) increase() error {
+	c := r.redisClient
+	id, err := acquireLockWithTimeout(c.Conn(), time.Second, time.Millisecond*10)
+	if err != nil {
+		log.Fatal("failed to acquire lock")
+	}
+	err = c.Watch(func(tx *redis.Tx) error {
+		if tx.Exists(heldKey).Val() == 1 {
 			return errors.New("LIMIT REACHED")
 		}
 		value := int(tx.Incr(counterKey).Val())
-		threshold, err := strconv.Atoi(tx.Get(thresholdKey).Val())
-		if err != nil {
-			panic(err)
-		}
-		if value >= threshold {
-			tx.Set(heldKey, "1", time.Second * 1000)
+		if value >= r.threshold {
+			tx.Pipelined(func(p redis.Pipeliner) error {
+				tx.MSet(heldKey, "1")
+				return nil
+			})
 		}
 		return nil
-	})
+	}, lockedKey)
 	if err != nil {
+		releaseLock(c, id)
+		fmt.Println("watch value changed ", err)
 		return err
 	}
 	return releaseLock(c, id)
 }
 
-func reset(c *redis.Client) {
-	id, _ := acquireLockWithTimeout(c.Conn(), time.Second, time.Second)
+func (r *ratelimiter) reset() {
+	c := r.redisClient
+	id, err := acquireLockWithTimeout(c.Conn(), time.Second*5, time.Millisecond*600)
+	if err != nil {
+		log.Fatalln("failed to acquire lock on reset ", err)
+	}
 	c.Watch(func(tx *redis.Tx) error {
+		if tx.Exists(resetTimeKey).Val() == 1 {
+			return nil
+		}
+		r.nextResetTime = time.Now().Add(r.interval)
+		fmt.Println(r.nextResetTime)
 		tx.Pipelined(func(p redis.Pipeliner) error {
 			p.Del(heldKey, counterKey)
+			p.MSet(
+				thresholdKey, r.threshold,
+				intervalKey, r.interval.Seconds(),
+				resetTimeKey, r.nextResetTime.Unix(),
+			)
+			p.Expire(resetTimeKey, r.interval)
 			return nil
 		})
 		return nil

@@ -6,9 +6,12 @@ import (
 )
 
 type ratelimiter struct {
-	redisClient *redis.Client
-	threshold   int
-	interval    time.Duration
+	redisClient   *redis.Client
+	threshold     int
+	interval      time.Duration
+	nextResetTime time.Time
+
+	ResetChan     chan<- struct{}
 }
 
 func NewRateLimiter(c *redis.Client, interval time.Duration, threshold int) *ratelimiter {
@@ -17,12 +20,12 @@ func NewRateLimiter(c *redis.Client, interval time.Duration, threshold int) *rat
 		threshold:   threshold,
 		interval:    interval,
 	}
-	initRedis(r.redisClient, r)
 	go r.resetLoop()
 	return &r
 }
 
 func (r *ratelimiter) resetLoop() {
+	r.reset()
 	for {
 		select {
 		case <-time.Tick(r.interval):
@@ -32,9 +35,5 @@ func (r *ratelimiter) resetLoop() {
 }
 
 func (r *ratelimiter) Incr() error {
-	return increase(r.redisClient)
-}
-
-func (r *ratelimiter) reset() {
-	reset(r.redisClient)
+	return r.increase()
 }
