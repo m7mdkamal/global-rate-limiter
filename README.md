@@ -16,3 +16,6 @@ func main() {
     _ = rateLimiter.Incr() // returns error on limit reached
 }
 ```
+## Todo
+- [ ] Configure redis prefix
+- [ ] Write tests
