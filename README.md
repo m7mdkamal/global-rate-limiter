@@ -19,3 +19,4 @@ func main() {
 ## Todo
 - [ ] Configure redis prefix
 - [ ] Write tests
+- [ ] Write redis scripts in lua
